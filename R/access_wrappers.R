@@ -40,7 +40,7 @@ extractRawCountMatrices.Conos <- function(con, transposed=TRUE) {
 
 extractRawCountMatrices.Seurat <- function(so, transposed=TRUE) {
   cms <- so$sample.per.cell %>% {split(names(.), .)} %>%
-    lapply(function(cids) so@assays$RNA@counts[,cids])
+    lapply(function(cids) so@assays$SCT@counts[,cids])
   if (transposed) {
     cms %<>% lapply(Matrix::t)
   }
@@ -64,16 +64,16 @@ extractJointCountMatrix.Conos <- function(con, raw=TRUE) {
 
 extractJointCountMatrix.Seurat <- function(so, raw=TRUE, transposed=TRUE, sparse=TRUE) {
   if (raw) {
-    dat <- so@assays$RNA@counts
+    dat <- so@assays$SCT@counts
     if (transposed) dat %<>% Matrix::t()
     return(dat)
   }
 
-  dat <- Seurat::GetAssayData(so, slot='scale.data', assay='RNA')
+  dat <- Seurat::GetAssayData(so, slot='scale.data', assay='SCT')
   dims <- dim(dat)
   dat.na <- all(dims == 1) && all(is.na(x = dat))
   if (all(dims == 0) || dat.na) {
-    dat <- Seurat::GetAssayData(so, slot='data', assay='RNA')
+    dat <- Seurat::GetAssayData(so, slot='data', assay='SCT')
   }
 
   if (transposed) dat %<>% Matrix::t()
@@ -97,10 +97,10 @@ extractOdGenes.Conos <- function(con, n.genes=NULL) {
 }
 
 extractOdGenes.Seurat <- function(so, n.genes=NULL) {
-  if (is.null(so@assays$RNA@meta.features$vst.variance.standardized))
+  if (is.null(so@assays$SCT@meta.features$vst.variance.standardized))
     stop("The data object doesn't have gene variance info.",
-         "Please, run FindVariableFeatures(assay='RNA, selection.method='vst') first")
-  genes <- so@assays$RNA@meta.features %>%
+         "Please, run FindVariableFeatures(assay='SCT, selection.method='vst') first")
+  genes <- so@assays$SCT@meta.features %>%
     {rownames(.)[order(.$vst.variance.standardized, decreasing=TRUE)]} %>%
     head(n.genes %||% length(.))
 
