@@ -163,7 +163,7 @@ Cacoa <- R6::R6Class("Cacoa", lock_objects=FALSE,
     #'   - `sample.groups`: same as the provided variable
     #'   - `cell.groups`: same as the provided variable
     estimateExpressionShiftMagnitudes=function(cell.groups=self$cell.groups, dist='cor', normalize.both=TRUE,
-                                               n.top.genes=Inf, min.cells.per.sample=10, min.samp.per.type=2, min.gene.frac=0.01,
+                                               min.cells.per.sample=10, min.samp.per.type=2, min.gene.frac=0.01,
                                                ref.level=self$ref.level, sample.groups=self$sample.groups,
                                                verbose=self$verbose, n.cores=self$n.cores, name="expression.shifts",
                                                n.permutations=1000, p.adjust.method='BH', ...) {
@@ -171,7 +171,7 @@ Cacoa <- R6::R6Class("Cacoa", lock_objects=FALSE,
 
       if (verbose) cat("Filtering data... ")
       shift.inp <- count.matrices %>%
-        filterExpressionDistanceInput(cell.groups=self$cell.groups, sample.per.cell=self$sample.per.cell, sample.groups=self$sample.groups,
+        filterExpressionDistanceInput(cell.groups=cell.groups, sample.per.cell=self$sample.per.cell, sample.groups=self$sample.groups,
                                       min.cells.per.sample=min.cells.per.sample, min.samp.per.type=min.samp.per.type, min.gene.frac=min.gene.frac)
       if (verbose) cat("done!\n")
 
@@ -189,105 +189,40 @@ Cacoa <- R6::R6Class("Cacoa", lock_objects=FALSE,
       return(invisible(self$test.results[[name]]))
     },
 
-    estimateCommonExpressionShiftMagnitudes=function(sample.groups=self$sample.groups, cell.groups=self$cell.groups, n.cells=NULL, n.randomizations=50, n.subsamples=30, min.cells=10,
-                                                     n.cores=self$n.cores, verbose=self$verbose,  mean.trim=0.1, name='common.expression.shifts') {
-      if(length(levels(sample.groups))!=2) stop("'sample.groups' must be a 2-level factor describing which samples are being contrasted")
+    estimateCommonExpressionShiftMagnitudes=function(cell.groups=self$cell.groups,
+                                                     min.cells.per.sample=10, min.samp.per.type=2, min.gene.frac=0.01,
+                                                     n.randomizations=50, verbose=self$verbose, name='common.expression.shifts', ...) {
+      shift.inp <- extractRawCountMatrices(self$data.object, transposed=TRUE) %>%
+        filterExpressionDistanceInput(cell.groups=cell.groups, sample.per.cell=self$sample.per.cell, sample.groups=self$sample.groups,
+                                      min.cells.per.sample=min.cells.per.sample, min.samp.per.type=min.samp.per.type, min.gene.frac=min.gene.frac)
 
-      count.matrices <- extractRawCountMatrices(self$data.object, transposed=T)
+      cell.groups <- shift.inp$cell.groups
+      sample.groups <- shift.inp$sample.groups
+      caggr <- shift.inp$cms
 
-      common.genes <- Reduce(intersect, lapply(count.matrices, colnames))
-      count.matrices %<>% lapply(`[`, , common.genes)
+      dists.norm <- list(); dists.raw <- list(); dists.rand <- list(); dist.norm.sub <- list()
+      for (ct in levels(cell.groups)) { # for each cell type
+        # TODO: need to make this loop parallel
+        tcm <- lapply(caggr,function(x) x[match(ct, rownames(x)),]) %>% do.call(rbind, .) %>% na.omit()
+        tcm <- log(1e3 * tcm / rowSums(tcm) + 1) # log transform
+        tcm <- t(tcm)
 
-      comp.matrix <- outer(sample.groups,sample.groups,'!='); diag(comp.matrix) <- FALSE
-
-
-      # get a cell sample factor, restricted to the samples being contrasted
-      cl <- lapply(count.matrices[names(sample.groups)], rownames)
-      cl <- rep(names(cl), sapply(cl, length)) %>% setNames(unlist(cl)) %>%  as.factor()
-
-      # cell factor
-      cf <- cell.groups
-      cf <- cf[names(cf) %in% names(cl)]
-
-      # if(is.null(n.cells)) {
-      #   n.cells <- min(table(cf)) # use the size of the smallest group
-      #   if(verbose) cat('setting group size of ',n.cells,' cells for comparisons\n')
-      # }
-
-      if(!is.null(n.cells) && n.cells>=length(cf)) {
-        if(n.subsamples>1) {
-          warning('turning off subsampling, as n.cells exceeds the total number of cells')
-          n.subsamples <- 1;
-        }
-      }
-
-      if(verbose) cat('running',n.subsamples,'subsamples,',n.randomizations,'randomizations each ... \n')
-      ctdll <- sccore:::plapply(1:n.subsamples,function(i) {
-        # subsample cells
-
-        # draw cells without sample stratification - this can drop certain samples, particularly those with lower total cell numbers
-        if(!is.null(n.cells)) {
-          cf <- tapply(names(cf),cf,function(x) {
-            if(length(x)<=n.cells) { return(cf[x]) } else { setNames(rep(cf[x[1]],n.cells), sample(x,n.cells)) }
-          })
-        }
-
-        # calculate expected mean number of cells per sample and aim to sample that
-        n.cells.scaled <- max(min.cells,ceiling(n.cells/length(sample.groups)));
-        cf <- tapply(names(cf),list(cf,cl[names(cf)]),function(x) {
-          if(length(x)<=n.cells.scaled) { return(cf[x]) } else { setNames(rep(cf[x[1]],n.cells.scaled), sample(x,n.cells.scaled)) }
+        obs.dists <- consensusShiftDistances(tcm, sample.groups, ...)
+        randomized.dists <- lapply(1:n.randomizations,function(i) {
+          sg.shuffled <- sample.groups %>% {setNames(sample(as.character(.)), names(.))} %>% as.factor()
+          consensusShiftDistances(tcm, sg.shuffled, ...)
         })
 
-        cf <- as.factor(setNames(unlist(lapply(cf,as.character)),unlist(lapply(cf,names))))
+        # normalize true distances by the mean of the randomized ones
+        dists.norm[[ct]] <- abs(obs.dists) / mean(abs(unlist(randomized.dists)))
+        dist.norm.sub[[ct]] <- abs(obs.dists) - median(abs(unlist(randomized.dists)))
+        dists.raw[[ct]] <- obs.dists
+        dists.rand[[ct]] <- randomized.dists
+      }
 
-        # table of sample types and cells
-        cct <- table(cf,cl[names(cf)])
-        caggr <- lapply(count.matrices, collapseCellsByType, groups=as.factor(cf), min.cell.count=1)[names(sample.groups)]
-
-        ctdl <- sccore::plapply(sccore:::sn(levels(cf)),function(ct) { # for each cell type
-          tcm <- na.omit(do.call(rbind,lapply(caggr,function(x) x[match(ct,rownames(x)),])))
-          tcm <- log(tcm/rowSums(tcm)*1e3+1) # log transform
-          tcm <- t(tcm[cct[ct,rownames(tcm)]>=min.cells,,drop=F])
-
-          # an internal function to calculate consensus change direction and distances between samples along this axis
-          t.consensus.shift.distances <- function(tcm,sample.groups, useCpp=TRUE) {
-            if(min(table(sample.groups[colnames(tcm)]))<1) return(NA); # not enough samples
-            if(useCpp) {
-              g1 <- which(sample.groups[colnames(tcm)]==levels(sample.groups)[1])-1
-              g2 <- which(sample.groups[colnames(tcm)]==levels(sample.groups)[2])-1
-              as.numeric(projdiff(tcm,g1,g2))
-            } else {
-              # calculate consensus expression shift
-              s1 <- colnames(tcm)[sample.groups[colnames(tcm)]==levels(sample.groups)[1]]
-              s2 <- colnames(tcm)[sample.groups[colnames(tcm)]==levels(sample.groups)[2]]
-              dm <- do.call(rbind,lapply(s1,function(n1) {
-                do.call(rbind,lapply(s2,function(n2) {
-                  tcm[,n1]-tcm[,n2]
-                }))
-              }))
-              dmm <- apply(dm,2,mean,trim=mean.trim)
-              dmm <- dmm/sqrt(sum(dmm^2)) # normalize
-
-              # project samples and calculate distances
-              as.numeric(dm %*% dmm)
-            }
-          }
-
-          # true distances
-          tdist <- t.consensus.shift.distances(tcm,sample.groups)
-          # randomized distances
-
-          rdist <- lapply(1:n.randomizations,function(i) {
-            t.consensus.shift.distances(tcm,as.factor(setNames(sample(as.character(sample.groups)), names(sample.groups))))
-          })
-
-          # normalize true distances by the mean of the randomized ones
-          return(abs(tdist)/mean(abs(unlist(rdist))))
-        },n.cores = 1,mc.preschedule = FALSE, progress=(n.subsamples<=1))
-
-      },n.cores=ifelse(n.subsamples>1,n.cores,1), mc.preschedule=FALSE, progress=(verbose && n.subsamples>1))
-
-      return(invisible(self$test.results[[name]] <- ctdll))
+      self$test.results[[name]] <- list(dists.norm=dists.norm, dist.norm.sub=dist.norm.sub,
+                                        dists.raw=dists.raw, dists.rand=dists.rand)
+      return(invisible(self$test.results[[name]]))
 
     },
 
@@ -339,28 +274,19 @@ Cacoa <- R6::R6Class("Cacoa", lock_objects=FALSE,
     ##' @param show.regression whether to show a slope line in the size dependency plot
     ##' @param show.regression whether to show a whiskers in the size dependency plot
     ##' @return A ggplot2 object
-    plotCommonExpressionShiftMagnitudes=function(name='common.expression.shifts', show.subsampling.variability=FALSE, show.jitter=FALSE, jitter.alpha=0.05, type='box',
+    plotCommonExpressionShiftMagnitudes=function(name='common.expression.shifts', show.jitter=FALSE, jitter.alpha=0.05, type='box',
                                                  notch=TRUE, show.size.dependency=FALSE, show.whiskers=TRUE, show.regression=TRUE, font.size=5, ...) {
-      res <- private$getResults(name, 'estimateCommonExpressionShiftMagnitudes')
-      cn <- setNames(names(res[[1]]),names(res[[1]]))
-      if(show.subsampling.variability) { # average across patient pairs
-        if(length(res) < 2) stop('the result has only one subsample; please set show.sampling.variability=FALSE')
-        df <- lapply(res,function(d) data.frame(value=unlist(lapply(d, mean)), Type=names(d)))
-      } else { # average across subsampling rounds
-        df <- lapply(cn, function(n) {
-          lapply(res, `[[`, n) %>% do.call(rbind, .) %>% colMeans(na.rm=TRUE) %>%
-            {data.frame(value=., Type=n)}
-        })
-      }
-
-      df %<>% do.call(rbind, .)
+      res <- private$getResults(name, 'estimateCommonExpressionShiftMagnitudes')$dist.norm.sub
+      df <- names(res) %>%
+        lapply(function(n) data.frame(value=res[[n]], Type=n)) %>%
+        do.call(rbind, .) %>% na.omit()
 
       if(show.size.dependency) {
         plotCellTypeSizeDep(df, self$cell.groups, palette=self$cell.groups.palette,ylab='common expression distance', yline=NA,
                             show.whiskers=show.whiskers, show.regression=show.regression, plot.theme=self$plot.theme, ...)
       } else {
         plotMeanMedValuesPerCellType(df, show.jitter=show.jitter,jitter.alpha=jitter.alpha, notch=notch, type=type, palette=self$cell.groups.palette,
-                                     ylab='common expression distance', plot.theme=self$plot.theme, ...)
+                                     ylab='common expression distance', plot.theme=self$plot.theme, yline=0.0, ...)
       }
     },
 
@@ -495,6 +421,8 @@ Cacoa <- R6::R6Class("Cacoa", lock_objects=FALSE,
       } else stop(paste('Resampling method', resampling.method, 'is not supported'))
 
       raw.mats <- extractRawCountMatrices(self$data.object, transposed=TRUE)
+
+      self$test.results[['raw']] <- raw.mats
 
       expr.fracs <- self$getJointCountMatrix() %>%
         getExpressionFractionPerGroup(cell.groups)
@@ -2378,108 +2306,15 @@ Cacoa <- R6::R6Class("Cacoa", lock_objects=FALSE,
         n.perm <- 1
       }
 
-      # Apply bootstrap
-      loadings <- plapply(1:n.boot, function(ib){
-
-        # Create samples for bootstrap
-        samples.tmp <- sample(rownames(cnts), nrow(cnts), replace=TRUE)
-        groups.tmp <- groups[samples.tmp]
-
-        # Check that both groups are presented
-        while((sum(groups.tmp) == 0) || (sum(!groups.tmp) == 0)) {
-          # Create samples by bootstrap
-          samples.tmp <- sample(rownames(cnts), nrow(cnts), replace=TRUE)
-          groups.tmp <- groups[samples.tmp]
-        }
-        cnts.tmp <- cnts[samples.tmp,]
-
-        # Produce resamplings of cell types within samples with remaining groups. Only one(!) resampling: n.perm=1
-        init.tmp <- produceResampling(cnts=cnts.tmp, groups=groups.tmp, n.perm=1,
-                                  replace.samples=FALSE, remain.groups=TRUE, seed=n.seed+ib)
-        init.l <- getLoadings(init.tmp$cnts[[1]], init.tmp$groups[[1]], criteria = criteria, ref.cell.type = ref.cell.type)
-
-        # if you test significance, then you need to generate the null distribution
-        if (coda.test == 'significance') {
-          null.tmp <- produceResampling(cnts = cnts.tmp, groups = groups.tmp, n.perm = n.perm,
-                                    replace.samples = F,
-                                    remain.groups = FALSE, seed = n.seed+ib)
-          null.l <- sapply(1:length(null.tmp$cnts), function(i)
-            getLoadings(null.tmp$cnts[[i]], null.tmp$groups[[i]], criteria = criteria, ref.cell.type = ref.cell.type) )
-        } else {
-          null.l <- NULL
-        }
-
-        loadings.tmp <- list(init = init.l, null = null.l)
-
-      }, n.cores=min(n.boot, n.cores), progress=verbose, fail.on.error=TRUE, mc.preschedule=TRUE)
-
-
-      if(coda.test == 'significance') {
-        # Get mean loadings from bootstrap
-        loadings.init <- c()
-        for(ib in 1:length(loadings)) {  # index for bootstrap
-          loadings.init <- cbind(loadings.init, loadings[[ib]]$init)
-        }
-        loadings.null <- c()
-        for(ip in 1:n.perm) {  # index for permutation
-          loadings.tmp <- c()
-          for(ib in 1:length(loadings)) {  # index for bootstrap
-            if(ncol(loadings[[ib]]$null) < ip) {
-              loadings.tmp <- c()
-              break  # everything is ok, no errors, but do not remove this if-break
-            }
-            loadings.tmp <- cbind(loadings.tmp, loadings[[ib]]$null[,ip])
-          }
-          if (length(loadings.tmp) == 0) break    # everything is ok, no errors, but do not remove
-          loadings.null <- cbind(loadings.null,rowMeans(loadings.tmp))
-        }
-        # Calculate p-values by permutation test
-        loadings.init.mean <- rowMeans(loadings.init)
-        tmp <- sapply(1:nrow(loadings.null), function(i) sum(loadings.null[i,] > loadings.init.mean[i])) / ncol(loadings.null)
-        pval <- apply((cbind(tmp, 1-tmp)), 1, min) * 2
-        names(pval) <- rownames(loadings.null)
-        padj <- p.adjust(pval, method <- 'fdr')
-      } else {
-        loadings.init <- c()
-        for(i in 1:length(loadings)){
-          loadings.init <- cbind(loadings.init, loadings[[i]]$init)
-        }
-        # Calculate p-values of confidence interval by bootstrap
-        tmp <- sapply(1:nrow(loadings.init), function(i) sum(0 > loadings.init[i,])) / ncol(loadings.init)
-        pval <- apply((cbind(tmp, 1-tmp)), 1, min) # multiply by * 2 ?
-        names(pval) <- rownames(loadings.init)
-
-        # ----------------------------
-        # Additional correction of p-values
-        ld <- loadings.init
-        ld.means <- rowMeans(ld)
-
-        idx <- order(abs(ld.means))
-        ld <- ld[idx,]
-        ld.means <- ld.means[idx]
-        pvals_tmp <- rep(0,length(ld.means))
-        pvals_tmp[1] <- 1
-        for(i in 2:length(ld.means)){
-          tmp <- sum(ld[i,] > ld.means[i-1]) / ncol(ld)
-          tmp <- min(tmp, 1-tmp)
-          pvals_tmp[i] <- min(tmp, pvals_tmp[i-1])
-        }
-        names(pvals_tmp) <- rownames(ld)
-        # print(pvals_tmp)
-        # Combining p-values
-        pval <- rowMax(cbind(pval, pvals_tmp[names(pval)]))
-        names(pval) <- rownames(loadings.init)
-        # ----------------------------
-
-        padj <- p.adjust(pval, method <- 'fdr')
-
-        loadings.null <- NULL
-      }
+      res <- runCoda(cnts, groups, n.seed=239)
+      loadings.init <- res$loadings.init
+      padj <- res$padj
+      pval <- res$pval
 
       self$test.results[['loadings']] = list(loadings = loadings.init,
-                                             loadings.data = loadings.init,
-                                             loadings.null = loadings.null,
-                                             loadings.list = loadings,
+                                             # loadings.data = loadings.init,
+                                             # loadings.null = loadings.null,
+                                             # loadings.list = loadings,
                                              pval = pval,
                                              padj = padj,
                                              cnts = cnts,
