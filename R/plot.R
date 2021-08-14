@@ -195,6 +195,7 @@ getOntologyPlotTitle <- function(genes, cell.subgroup, type) {
 }
 
 estimateMeanCI <- function(arr, quant=0.05, n.samples=500, ...) {
+  if (length(arr) == 1) return(c(NA, NA))
   s.means <- sapply(1:n.samples, function(i) mean(sample(arr, replace=TRUE), ...))
   return(quantile(s.means, c(quant, 1 - quant)))
 }
@@ -208,10 +209,13 @@ estimateMeanCI <- function(arr, quant=0.05, n.samples=500, ...) {
 #' @param notch - whether to show notches in the boxplot version (default=TRUE)
 #' @param palette - cell type palette
 #' @return A ggplot2 object
-plotMeanMedValuesPerCellType <- function(df, pvalues=NULL, type='bar', show.jitter=TRUE, notch=TRUE, jitter.alpha=0.05, palette=NULL,
-                                         ylab='expression distance', yline=1, plot.theme=theme_get(), jitter.size=1, line.size=0.75, trim=0,
+plotMeanMedValuesPerCellType <- function(df, pvalues=NULL, type=c('box', 'point', 'bar'), show.jitter=TRUE,
+                                         notch=TRUE, jitter.alpha=0.05, palette=NULL, ylab='expression distance',
+                                         yline=1, plot.theme=theme_get(), jitter.size=1, line.size=0.75, trim=0,
                                          order.x=TRUE, pvalue.y=NULL) {
+  type <- match.arg(type)
   df$Type %<>% as.factor()
+
   # calculate mean, se and median
   odf <- df <- na.omit(df); # full df is now in odf
 
@@ -222,8 +226,8 @@ plotMeanMedValuesPerCellType <- function(df, pvalues=NULL, type='bar', show.jitt
   df %<>% group_by(Type) %>%
     summarise(mean=mean(value, trim=trim), med=median(value)) %>%
     mutate(Type=as.character(Type)) %>%
-    mutate(LI=sapply(Type, function(ct) conf.ints[[ct]][1]),
-           UI=sapply(Type, function(ct) conf.ints[[ct]][2])) %>%
+    mutate(LI=as.numeric(sapply(Type, function(ct) conf.ints[[ct]][1])),
+           UI=as.numeric(sapply(Type, function(ct) conf.ints[[ct]][2]))) %>%
     .[!is.na(.$mean),] %>%
     mutate(Type=factor(Type, levels=levels(odf$Type)))
 
@@ -253,7 +257,7 @@ plotMeanMedValuesPerCellType <- function(df, pvalues=NULL, type='bar', show.jitt
   p <- p +
     plot.theme +
     theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1, size=12),
-          axis.text.y=element_text(angle=90, hjust=0.5, size=12)) + guides(fill=FALSE)+
+          axis.text.y=element_text(angle=90, hjust=0.5, size=12)) + guides(fill="none")+
     theme(legend.position = "none")+
     labs(x="", y=ylab)
 
@@ -313,7 +317,7 @@ plotCellTypeSizeDep <- function(df, cell.groups, palette=NULL, font.size=4, ylab
   if(!is.na(yline)) { p <- p+ geom_hline(yintercept = 1,linetype=2,color='gray50') }
   p <- p +
     plot.theme +
-    guides(fill=FALSE)+
+    guides(fill="none")+
     theme(legend.position = "none")+
     labs(x="number of cells", y=ylab)
   if(!is.null(palette)) {

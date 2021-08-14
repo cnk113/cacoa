@@ -158,7 +158,7 @@ Cacoa <- R6::R6Class("Cacoa", lock_objects=FALSE,
     #' @param n.cores Number of cores (default: stored integer)
     #' @param name Test name (default="expression.shifts")
     #' @return a list include
-    #'   - `dist.df`: a table with cluster distances (normalized if within.gorup.normalization=TRUE), cell type and the number of cells
+    #'   - `dist.df`: a table with cluster distances (normalized if within.gorup.normalization=TRUE), cell type and the number of cells # TODO: update
     #'   - `p.dist.info`: list of distance matrices per cell type
     #'   - `sample.groups`: same as the provided variable
     #'   - `cell.groups`: same as the provided variable
@@ -166,64 +166,85 @@ Cacoa <- R6::R6Class("Cacoa", lock_objects=FALSE,
                                                min.cells.per.sample=10, min.samp.per.type=2, min.gene.frac=0.01,
                                                ref.level=self$ref.level, sample.groups=self$sample.groups,
                                                verbose=self$verbose, n.cores=self$n.cores, name="expression.shifts",
-                                               n.permutations=1000, p.adjust.method='BH', ...) {
+                                               n.permutations=1000, p.adjust.method='BH', genes=NULL, n.pcs=NULL,
+                                               top.n.genes=NULL, ...) {
       count.matrices <- extractRawCountMatrices(self$data.object, transposed=TRUE)
 
       if (verbose) cat("Filtering data... ")
-      shift.inp <- count.matrices %>%
-        filterExpressionDistanceInput(cell.groups=cell.groups, sample.per.cell=self$sample.per.cell, sample.groups=self$sample.groups,
-                                      min.cells.per.sample=min.cells.per.sample, min.samp.per.type=min.samp.per.type, min.gene.frac=min.gene.frac)
+      shift.inp <- filterExpressionDistanceInput(
+        count.matrices, cell.groups=cell.groups,
+        sample.per.cell=self$sample.per.cell, sample.groups=self$sample.groups,
+        min.cells.per.sample=min.cells.per.sample, min.samp.per.type=min.samp.per.type,
+        min.gene.frac=min.gene.frac, genes=genes, verbose=verbose
+      )
       if (verbose) cat("done!\n")
 
-      res <- shift.inp %$%
-        estimateExpressionShiftMagnitudes(cms, sample.groups=sample.groups, cell.groups=cell.groups, sample.per.cell=self$sample.per.cell,
-                                          dist=tolower(dist), normalize.both=normalize.both, verbose=verbose, ref.level=ref.level, ...)
+      if (!is.null(n.pcs)) {
+        if (!is.null(top.n.genes) && n.pcs > top.n.genes) {
+          n.pcs <- top.n.genes - 1
+          warning("n.pcs can't be larger than top.n.genes - 1, setting it to ", n.pcs)
+        }
 
-      if (verbose) cat("Estimating p-values...\n")
-      res$pvalues <- estimateExpressionShiftPValues(res$p.dist.info, sample.groups, n.permutations=n.permutations,
-                                                    n.cores=n.cores, verbose=verbose)$pvalues
-      res$padjust <- p.adjust(res$pvalues, method=p.adjust.method)
-      if (verbose) cat("Done!\n")
+        n.samps.per.type <- shift.inp$cm.per.type %>% sapply(nrow)
+        affected.types <- which(n.samps.per.type <= n.pcs)
+        if (length(affected.types) > 0) {
+          affected.types %<>% names() %>% paste(collapse=", ")
+          n.pcs <- min(n.samps.per.type) - 1
+          warning("Cell types '", affected.types, "' don't have enough samples present. Setting n.pcs to ", n.pcs,
+                  ". Consider increasing min.samp.per.type.")
+        }
+      }
 
-      self$test.results[[name]] <- res
+      self$test.results[[name]] <- shift.inp %$%
+        estimateExpressionShiftMagnitudes(
+          cm.per.type, sample.groups=sample.groups, cell.groups=cell.groups, sample.per.cell=self$sample.per.cell,
+          dist=tolower(dist), normalize.both=normalize.both, verbose=verbose, ref.level=ref.level,
+          n.permutations=n.permutations, top.n.genes=top.n.genes, n.pcs=n.pcs, n.cores=n.cores, ...
+        )
+
       return(invisible(self$test.results[[name]]))
     },
 
-    estimateCommonExpressionShiftMagnitudes=function(cell.groups=self$cell.groups,
+    estimateCommonExpressionShiftMagnitudes=function(cell.groups=self$cell.groups, name='common.expression.shifts',
                                                      min.cells.per.sample=10, min.samp.per.type=2, min.gene.frac=0.01,
-                                                     n.randomizations=50, verbose=self$verbose, name='common.expression.shifts', ...) {
+                                                     n.permutations=1000, trim=0.2, p.adjust.method="BH",
+                                                     verbose=self$verbose, n.cores=self$n.cores, ...) {
+      if (verbose) cat("Filtering data... ")
       shift.inp <- extractRawCountMatrices(self$data.object, transposed=TRUE) %>%
-        filterExpressionDistanceInput(cell.groups=cell.groups, sample.per.cell=self$sample.per.cell, sample.groups=self$sample.groups,
-                                      min.cells.per.sample=min.cells.per.sample, min.samp.per.type=min.samp.per.type, min.gene.frac=min.gene.frac)
+        filterExpressionDistanceInput(
+          cell.groups=cell.groups, sample.per.cell=self$sample.per.cell, sample.groups=self$sample.groups,
+          min.cells.per.sample=min.cells.per.sample, min.samp.per.type=min.samp.per.type, min.gene.frac=min.gene.frac
+        )
+      if (verbose) cat("done!\n")
 
-      cell.groups <- shift.inp$cell.groups
       sample.groups <- shift.inp$sample.groups
-      caggr <- shift.inp$cms
 
-      dists.norm <- list(); dists.raw <- list(); dists.rand <- list(); dist.norm.sub <- list()
-      for (ct in levels(cell.groups)) { # for each cell type
-        # TODO: need to make this loop parallel
-        tcm <- lapply(caggr,function(x) x[match(ct, rownames(x)),]) %>% do.call(rbind, .) %>% na.omit()
-        tcm <- log(1e3 * tcm / rowSums(tcm) + 1) # log transform
-        tcm <- t(tcm)
+      if (verbose) cat('Calculating distances ... ')
 
-        obs.dists <- consensusShiftDistances(tcm, sample.groups, ...)
-        randomized.dists <- lapply(1:n.randomizations,function(i) {
+      dists.norm <- list()
+      res.per.type <- levels(shift.inp$cell.groups) %>% sccore:::sn() %>% plapply(function(ct) {
+        cm.norm <- t(shift.inp$cm.per.type[[ct]])
+
+        dists <- consensusShiftDistances(cm.norm, sample.groups, ...)
+        obs.diff <- mean(dists, trim=trim)
+        randomized.dists <- lapply(1:n.permutations, function(i) {
           sg.shuffled <- sample.groups %>% {setNames(sample(as.character(.)), names(.))} %>% as.factor()
-          consensusShiftDistances(tcm, sg.shuffled, ...)
-        })
+          consensusShiftDistances(cm.norm, sg.shuffled, ...) %>% mean(trim=trim)
+        }) %>% unlist()
 
-        # normalize true distances by the mean of the randomized ones
-        dists.norm[[ct]] <- abs(obs.dists) / mean(abs(unlist(randomized.dists)))
-        dist.norm.sub[[ct]] <- abs(obs.dists) - median(abs(unlist(randomized.dists)))
-        dists.raw[[ct]] <- obs.dists
-        dists.rand[[ct]] <- randomized.dists
-      }
+        pvalue <- (sum(randomized.dists >= obs.diff) + 1) / (sum(!is.na(randomized.dists)) + 1)
+        dists <- dists - median(randomized.dists)
+        list(dists=dists, pvalue=pvalue)
+      }, progress=verbose, n.cores=n.cores, mc.preschedule=TRUE, fail.on.error=TRUE)
 
-      self$test.results[[name]] <- list(dists.norm=dists.norm, dist.norm.sub=dist.norm.sub,
-                                        dists.raw=dists.raw, dists.rand=dists.rand)
+      if (verbose) cat("done!\n")
+
+      pvalues <- sapply(res.per.type, `[[`, "pvalue")
+      dists.per.type <- lapply(res.per.type, `[[`, "dists")
+      padjust <- p.adjust(pvalues, method=p.adjust.method)
+
+      self$test.results[[name]] <- list(dists.per.type=dists.per.type, pvalues=pvalues, padjust=padjust)
       return(invisible(self$test.results[[name]]))
-
     },
 
     #' @description  Plot results from cao$estimateExpressionShiftMagnitudes()
@@ -239,9 +260,11 @@ Cacoa <- R6::R6Class("Cacoa", lock_objects=FALSE,
     #' @return A ggplot2 object
     plotExpressionShiftMagnitudes=function(name="expression.shifts", type='box', notch = TRUE, show.jitter=TRUE, jitter.alpha=0.05, show.size.dependency=FALSE,
                                            show.whiskers=TRUE, show.regression=TRUE, font.size=5, show.pvalues=c("adjusted", "raw", "none"), ...) {
-      res <- private$getResults(name, "estimateExpressionShiftMagnitudes()")
-      df <- res$dist.df
       show.pvalues <- match.arg(show.pvalues)
+      res <- private$getResults(name, "estimateExpressionShiftMagnitudes()")
+      df <- names(res$dists.per.type) %>%
+        lapply(function(n) data.frame(value=res$dists.per.type[[n]], Type=n)) %>%
+        do.call(rbind, .) %>% na.omit()
 
       if (show.pvalues == "adjusted") {
         pvalues <- res$padjust
@@ -275,18 +298,28 @@ Cacoa <- R6::R6Class("Cacoa", lock_objects=FALSE,
     ##' @param show.regression whether to show a whiskers in the size dependency plot
     ##' @return A ggplot2 object
     plotCommonExpressionShiftMagnitudes=function(name='common.expression.shifts', show.jitter=FALSE, jitter.alpha=0.05, type='box',
-                                                 notch=TRUE, show.size.dependency=FALSE, show.whiskers=TRUE, show.regression=TRUE, font.size=5, ...) {
-      res <- private$getResults(name, 'estimateCommonExpressionShiftMagnitudes')$dist.norm.sub
-      df <- names(res) %>%
-        lapply(function(n) data.frame(value=res[[n]], Type=n)) %>%
+                                                 notch=TRUE, show.size.dependency=FALSE, show.whiskers=TRUE, show.regression=TRUE, font.size=5,
+                                                 show.pvalues=c("adjusted", "raw", "none"), ...) {
+      show.pvalues <- match.arg(show.pvalues)
+      res <- private$getResults(name, 'estimateCommonExpressionShiftMagnitudes')
+      df <- names(res$dists.per.type) %>%
+        lapply(function(n) data.frame(value=res$dists.per.type[[n]], Type=n)) %>%
         do.call(rbind, .) %>% na.omit()
+
+      if (show.pvalues == "adjusted") {
+        pvalues <- res$padjust
+      } else if (show.pvalues == "raw") {
+        pvalues <- res$pvalues
+      } else {
+        pvalues <- NULL
+      }
 
       if(show.size.dependency) {
         plotCellTypeSizeDep(df, self$cell.groups, palette=self$cell.groups.palette,ylab='common expression distance', yline=NA,
                             show.whiskers=show.whiskers, show.regression=show.regression, plot.theme=self$plot.theme, ...)
       } else {
-        plotMeanMedValuesPerCellType(df, show.jitter=show.jitter,jitter.alpha=jitter.alpha, notch=notch, type=type, palette=self$cell.groups.palette,
-                                     ylab='common expression distance', plot.theme=self$plot.theme, yline=0.0, ...)
+        plotMeanMedValuesPerCellType(df, pvalues=pvalues, show.jitter=show.jitter,jitter.alpha=jitter.alpha, notch=notch, type=type,
+                                     palette=self$cell.groups.palette, ylab='common expression distance', plot.theme=self$plot.theme, yline=0.0, ...)
       }
     },
 
@@ -1782,7 +1815,7 @@ Cacoa <- R6::R6Class("Cacoa", lock_objects=FALSE,
     #' @param ... parameters forwarded to \link{plotHeatmap}
     #' @return A ggplot2 object
     plotOntologyHeatmap=function(genes="up", type="GO", subtype="BP", min.genes=1, p.adj=0.05, legend.position="left", selection="all", n=20,
-                                 clusters=TRUE, cluster.name=NULL, cell.subgroups=NULL, color.range=NULL, palette=NULL, row.order = TRUE, col.order = TRUE, legend.title = NULL, ...) {
+                                 clusters=TRUE, cluster.name=NULL, cell.subgroups=NULL, color.range=NULL, palette=NULL, row.order = TRUE, col.order = TRUE, legend.title = NULL, row.dendrogram = F, col.dendrogram = F, ...) {
       checkPackageInstalled(c("ComplexHeatmap"), bioc=TRUE)
       checkPackageInstalled(c("circlize"), bioc=FALSE)
 
@@ -1839,10 +1872,10 @@ Cacoa <- R6::R6Class("Cacoa", lock_objects=FALSE,
       # })
 
       # New
-      tmp <- as.matrix(ont.sum %>% .[order(rowSums(.), decreasing = T),] %>% .[1:n,]) %>% {.[,!colSums(.) == 0]}
+      tmp <- as.matrix(ont.sum %>% .[order(rowSums(.), decreasing = T),] %>% .[1:pmin(nrow(.), n),]) %>% {.[,!colSums(.) == 0]}
 
       if(is.null(color.range)) {
-        color.range <- c(min(0, min(tmp)), max(tmp))
+        color.range <- c(min(0, min(tmp, na.rm = T)), max(tmp, na.rm = T))
         if(color.range[2] > 20) {
           warning("Shrinking minimum adj. P value to -log10(20) for plotting.")
           color.range[2] <- 20
@@ -1854,19 +1887,19 @@ Cacoa <- R6::R6Class("Cacoa", lock_objects=FALSE,
       }
 
       pal <- if(genes == "up") {
-        colorRamp2(c(color.range[1], color.range[2]), c("grey98", "red"))
+        circlize::colorRamp2(c(color.range[1], color.range[2]), c("grey98", "red"))
       } else if(genes == "down") {
-        colorRamp2(c(color.range[1], color.range[2]), c("grey98", "blue"))
+        circlize::colorRamp2(c(color.range[1], color.range[2]), c("grey98", "blue"))
       } else {
-        colorRamp2(c(color.range[1], color.range[2]), c("grey98", "darkgreen"))
+        circlize::colorRamp2(c(color.range[1], color.range[2]), c("grey98", "darkgreen"))
       }
 
       # Plot
       ComplexHeatmap::Heatmap(tmp,
                               col=pal,
                               border=T,
-                              show_row_dend=F,
-                              show_column_dend=F,
+                              show_row_dend=row.dendrogram,
+                              show_column_dend=col.dendrogram,
                               heatmap_legend_param = list(title = title),
                               row_names_max_width = unit(8, "cm"),
                               row_names_gp = grid::gpar(fontsize = 10))
@@ -2260,7 +2293,10 @@ Cacoa <- R6::R6Class("Cacoa", lock_objects=FALSE,
     #' @description Plot contrast tree
     #' @return A ggplot2 object
     plotContrastTree=function(cell.groups=self$cell.groups, palette=self$sample.groups.palette,
-                              cells.to.remain = NULL, cells.to.remove = NULL, filter.empty.cell.types = TRUE) {
+                              cells.to.remain = NULL, cells.to.remove = NULL, filter.empty.cell.types = TRUE,
+                              p.val.adjustment = T, h.method='both') {
+      h.method.options = c('up', 'down', 'both')
+      if(!(h.method %in% h.method.options)) stop('Impossible metho of clustering')
       tmp <- private$extractCodaData(cells.to.remove=cells.to.remove, cells.to.remain=cells.to.remain, cell.groups=cell.groups)
       if(filter.empty.cell.types) {
         cell.type.to.remain <- (colSums(tmp$d.counts[tmp$d.groups,]) > 0) &
@@ -2268,11 +2304,26 @@ Cacoa <- R6::R6Class("Cacoa", lock_objects=FALSE,
         tmp$d.counts <- tmp$d.counts[,cell.type.to.remain]
       }
 
-      gg <- plotContrastTree(tmp$d.counts, tmp$d.groups, self$ref.level, self$target.level, plot.theme=self$plot.theme)
+      gg <- plotContrastTree(tmp$d.counts, tmp$d.groups, self$ref.level, self$target.level,
+                             plot.theme=self$plot.theme, p.val.adjustment = p.val.adjustment,
+                             h.method=h.method)
       if (!is.null(palette)) {
         gg <- gg + scale_color_manual(values=palette)
       }
       return(gg)
+    },
+
+
+    #' @description Plot contrast tree
+    #' @return A ggplot2 object
+    plotCompositionSimilarity=function(cell.groups=self$cell.groups, palette=self$sample.groups.palette,
+                              cells.to.remain = NULL, cells.to.remove = NULL, filter.empty.cell.types = TRUE) {
+
+      tmp <- private$extractCodaData(cells.to.remove=cells.to.remove, cells.to.remain=cells.to.remain, cell.groups=cell.groups)
+      res <- referenceSet(tmp$d.counts, tmp$d.groups)
+      heatmap(res$mx.first, scale = 'none')
+
+      # return(gg)
     },
 
 
@@ -2310,6 +2361,11 @@ Cacoa <- R6::R6Class("Cacoa", lock_objects=FALSE,
       loadings.init <- res$loadings.init
       padj <- res$padj
       pval <- res$pval
+      ref.load.level <- res$ref.load.level
+
+      self$test.results[['cell.groups.composition']] <- list(cell.list = res$cell.list,
+                                                             cnts = cnts,
+                                                             groups = groups)
 
       self$test.results[['loadings']] = list(loadings = loadings.init,
                                              # loadings.data = loadings.init,
@@ -2318,7 +2374,8 @@ Cacoa <- R6::R6Class("Cacoa", lock_objects=FALSE,
                                              pval = pval,
                                              padj = padj,
                                              cnts = cnts,
-                                             groups = groups)
+                                             groups = groups,
+                                             ref.load.level = ref.load.level)
 
       return(invisible(self$test.results[['loadings']]))
     },
@@ -2341,7 +2398,8 @@ Cacoa <- R6::R6Class("Cacoa", lock_objects=FALSE,
       loadings <- private$getResults('loadings', 'estimateCellLoadings()')
       p <- plotCellLoadings(loadings$loadings, pval=loadings$padj, signif.threshold=signif.threshold,
                             jitter.alpha=alpha, palette=palette, show.pvals=show.pvals,
-                            ref.level=self$ref.level, target.level=self$target.level, plot.theme=self$plot.theme)
+                            ref.level=self$ref.level, target.level=self$target.level, plot.theme=self$plot.theme,
+                            ref.load.level = loadings$ref.load.level)
 
       return(p)
     },
@@ -2610,7 +2668,8 @@ Cacoa <- R6::R6Class("Cacoa", lock_objects=FALSE,
       cluster.shifts <- private$getResults(name, 'estimateExpressionShiftMagnitudes()')
       if (!joint) {
         df <- cluster.shifts %$%
-          estimateExpressionShiftDf(p.dist.info, sample.groups, return.dists.within=TRUE) %>%
+          lapply(p.dist.info, subsetDistanceMatrix, sample.groups, cross.factor=FALSE, build.df=TRUE) %>%
+          joinExpressionShiftDfs(sample.groups=cluster.shifts$sample.groups) %>%
           rename(group=Condition, variable=Type)
         plot.theme <- self$plot.theme
       } else {
