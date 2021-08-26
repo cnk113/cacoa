@@ -40,7 +40,7 @@ extractRawCountMatrices.Conos <- function(con, transposed=TRUE) {
 
 extractRawCountMatrices.Seurat <- function(so, transposed=TRUE) {
   cms <- so$sample.per.cell %>% {split(names(.), .)} %>%
-    lapply(function(cids) so@assays$RNA@counts[,cids])
+    lapply(function(cids) round(so@assays$RNA@counts[,cids]))
   if (transposed) {
     cms %<>% lapply(Matrix::t)
   }
@@ -64,7 +64,7 @@ extractJointCountMatrix.Conos <- function(con, raw=TRUE) {
 
 extractJointCountMatrix.Seurat <- function(so, raw=TRUE, transposed=TRUE, sparse=TRUE) {
   if (raw) {
-    dat <- so@assays$RNA@counts
+    dat <- round(so@assays$RNA@counts)
     if (transposed) dat %<>% Matrix::t()
     return(dat)
   }
