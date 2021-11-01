@@ -50,7 +50,7 @@ plotCodaSpaceInner <- function(df.space, df.loadings, d.groups, ref.level, targe
 }
 
 # helper function for creating dendograms
-ggdend <- function(dend.data, angle=90, plot.theme=theme_get(), font.size=3) {
+ggdend <- function(dend.data, angle=90, plot.theme=theme_get(), font.size=3, hjust=1) {
   ggplot() +
     geom_segment(data = dend.data$segments, aes(x=x, y=y, xend=xend, yend=yend)) +
     labs(x = "", y = "") + plot.theme +
@@ -58,11 +58,23 @@ ggdend <- function(dend.data, angle=90, plot.theme=theme_get(), font.size=3) {
           panel.grid = element_blank(), panel.border=element_blank(),
           axis.line=element_blank()) +
     geom_text(data = dend.data$labels, aes(x, y, label = label),
-              hjust=1, angle=angle, size=font.size) + ylim(-0.5, NA)
+              hjust=hjust, angle=angle, size=font.size) + ylim(-0.5, NA)
 }
 
-plotContrastTree <- function(d.counts, d.groups, ref.level, target.level, plot.theme,
-                             p.threshold=0.05, adjust.pvalues=TRUE, h.methods='both', font.size=3) {
+distTreeOrder <- function(t, tree.order){
+  t.labels <- t$tip.label[t$edge[t$edge[,2] < min(t$edge[,1]),2]]
+  t.labels <- t.labels[t.labels %in% tree.order]
+  s <- 0
+  for(i in 1:length(t.labels)){
+    j <- which(tree.order == t.labels[i])
+    s <- s + abs(i - j) ^ 2
+  }
+  return(s)
+}
+
+plotContrastTree <- function(d.counts, d.groups, ref.level, target.level, plot.theme, label.angle=90,
+                             p.threshold=0.05, adjust.pvalues=TRUE, h.methods='both', font.size=3, label.hjust=1,
+                             tree.order = NULL, pval.cell.types = NULL) {
   log.f <- getLogFreq(d.counts)
 
   if(h.methods == 'up'){
@@ -76,10 +88,36 @@ plotContrastTree <- function(d.counts, d.groups, ref.level, target.level, plot.t
     t.cur <- constructTreeUpDown(d.counts, d.groups)
   }
 
+  
 
   # t.cur <- constructBestPartitionTree(d.counts, d.groups)
+  
+  # Order the tree in the as similar as possible way
 
+  if(!is.null(tree.order)){
+    t <- t.cur$tree
+    tree.order <- intersect(tree.order, t$tip.label)
+    # distance of the initial tree
+    d = distTreeOrder(t, tree.order)
+    for(i.node in min(t$edge[,1]):max(t$edge[,1])){
+      
+      # alternative tree
+      t.alt <- ape::rotate(t, i.node)
+      d.alt <- distTreeOrder(t.alt, tree.order)
+      
+      if(d.alt <= d){
+        t <- t.alt
+        d <- d.alt
+      }
+    }
+    t.cur$tree <- t
+    t.cur$dendro <- tree2dendro_my(t.cur$tree)
+  }
+
+  
   tree <- t.cur$tree
+  
+  
   sbp <- sbpInNodes(tree)
   # sbp = t.cur$sbp
 
@@ -102,6 +140,8 @@ plotContrastTree <- function(d.counts, d.groups, ref.level, target.level, plot.t
   node.pos <- dend.data$segments %$% .[(y == yend) & (yend != 0),]
   node.pos$id <- tree$edge[,1]  # id of the inner node
   node.pos$to <- tree$edge[,2]
+  
+
 
   # Positions of inner nodes
   innode.pos <- unique(node.pos[,c('x','y','id')])
@@ -134,15 +174,12 @@ plotContrastTree <- function(d.counts, d.groups, ref.level, target.level, plot.t
 
   }
   p.val[is.na(p.val)] <- 1
-  if(adjust.pvalues){
-    p.adj <- p.adjust(p.val, method = 'fdr')
-  } else {
-    p.adj = p.val
-  }
 
-  px.init <- ggdend(dend.data, plot.theme=plot.theme, font.size=font.size)
+  p.adj <- if (adjust.pvalues) p.adjust(p.val, method='fdr') else p.val
 
-  if(sum(p.adj < p.threshold) == 0)
+  px.init <- ggdend(dend.data, plot.theme=plot.theme, font.size=font.size, angle=label.angle, hjust=label.hjust)
+
+  if (sum(p.adj < p.threshold) == 0)
     return(px.init)
 
   df.pval <- data.frame()
@@ -203,14 +240,26 @@ plotContrastTree <- function(d.counts, d.groups, ref.level, target.level, plot.t
                                         group=interaction(group, node)), size = 0.75) +
     geom_text(data=df.bal.range, mapping=aes(x=x, y=y, label=sprintf('%2.1f', val)), vjust=0, hjust=0, size=font.size) +
     labs(col=" ")
+  
+  if(!is.null(pval.cell.types)){
+    node.leaves <- node.pos[node.pos$to < min(tree$edge[,1]),]
+    node.leaves$label <- tree$tip.label[node.leaves$to]
+    node.leaves$pval <- pval.cell.types[node.leaves$label]
+    
+    node.leaves = node.leaves[node.leaves$pval < 0.05,]
+    
+    px <- px + geom_point(data=node.leaves, mapping=aes(x = xend, y=0.04), shape="\u25BC", size = 3)
+      
+  }
 
   return(px)
 }
 
 
-plotCellLoadings <- function(loadings, pval, signif.threshold, jitter.alpha, palette,
+plotCellLoadings <- function(loadings, pval, signif.threshold=0.05, jitter.alpha=0.1, palette,
                              show.pvals, ref.level, target.level, plot.theme,
-                             ordering=c("pvalue", "loading"), ref.load.level=0) {
+                             jitter.size=1,
+                             ordering=c("pvalue", "loading"), ref.load.level=0, annotation.position=1) {
   ordering <- match.arg(ordering)
   yintercept <- ref.load.level
 
@@ -236,15 +285,16 @@ plotCellLoadings <- function(loadings, pval, signif.threshold, jitter.alpha, pal
   ymax <- max(loadings)
 
   p <- ggplot(stack(res.ordered), aes(x = ind, y = values, fill=factor(ind))) +
-    geom_boxplot(notch=TRUE, outlier.shape = NA) + geom_jitter(aes(x = ind, y = values), alpha = jitter.alpha, size=1) +
+    geom_boxplot(notch=TRUE, outlier.shape = NA) +
+    geom_jitter(aes(x = ind, y = values), alpha = jitter.alpha, size=jitter.size) +
     geom_hline(yintercept = yintercept, color = "grey37") +
     coord_flip() + xlab('') + ylab('loadings') + plot.theme + theme(legend.position = "none") +
     scale_x_discrete(position = "top") + ylim(-1, 1)
 
   # Add text
   p <- p +
-    annotate('text', x = 1, y = -ymax, label = paste('\u2190', ref.level), hjust = 'left') +
-    annotate('text', x = 1, y = ymax, label = paste(target.level, '\u2192'), hjust = 'right')
+    annotate('text', x = annotation.position, y = -ymax, label = paste('\u2190', ref.level), hjust = 'left') +
+    annotate('text', x = annotation.position, y = ymax, label = paste(target.level, '\u2192'), hjust = 'right')
 
   if (!is.null(palette)) p <- p + scale_fill_manual(values=palette)
   if ((n.significant.cells > 0) && (ordering == "pvalue")) {
